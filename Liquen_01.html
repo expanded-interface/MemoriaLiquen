@@ -339,10 +339,10 @@
 
     <section class="momentos" aria-label="Las escenas de la experiencia">
       <article class="momento">
-        <span class="num">01 · BOSQUE · A TU RITMO</span>
+        <span class="num">01 · BOSQUE · HASTA 20 s PARA ELEGIR</span>
         <h2>Bosque presente<span>Coigües, usnea y lluvia</span></h2>
         <p>Los líquenes se encienden en los troncos cercanos.</p>
-        <span class="gesto">Al terminar la voz, apunta a un liquen y presiona el gatillo</span>
+        <span class="gesto">Al terminar la voz, busca el liquen que brilla y presiona el gatillo. Si no eliges en 20 s, el viaje sigue solo</span>
       </article>
       <article class="momento">
         <span class="num">02 · 02B · 55 s</span>
@@ -984,13 +984,127 @@
     }
   `;
 
+  /* ==========================================================
+     [Fusión] Red lineal: transformación del ecosistema de A hacia el lenguaje de B
+     Un solo juego de uniformes compartidos. La transformación avanza como un frente
+     que nace en el liquen de la roca madre (uOrigen) y se expande (uFrente, en metros).
+     · uLinea: intensidad de las líneas neón (0 fuera de las escenas 03 y 04)
+     · uOsc:   cuánto se apaga la materia original detrás del frente (sólo 04)
+     · uLineaMundo: líneas procedurales en suelo, rocas y troncos (sólo 04)
+     No hay segundo ecosistema: se reutilizan las geometrías existentes.
+     ========================================================== */
+  const UR = {
+    uLinea: {value: 0},
+    uOsc: {value: 0},
+    uFrente: {value: 999},
+    uOrigen: {value: new THREE.Vector3(0, 0, -1.55)},
+    uLineaMundo: {value: 0},
+    uLineaBase: {value: 0}, // neón sutil de la vegetación (escena 03), que continúa al entrar en la 04
+  };
+  // Dosificación por familia: la escena 03 sólo enciende la vegetación; la 04, todo
+  const PESO = {veg: {value: 0}, resto: {value: 0}};
+  // Colores de B en sRGB "crudo" (se escriben tal cual, como en B)
+  const crudo = (h) => new THREE.Vector3(((h >> 16) & 255) / 255, ((h >> 8) & 255) / 255, (h & 255) / 255);
+  const NEON_B = {teal: 0x1fbfae, mint: 0xc4ffe6, lime: 0xb4ff4d, lavender: 0xb7a3ff, amber: 0xffb347, orange: 0xff8a3d};
+  const GLSL_RED = /* glsl */ `
+    uniform float uLinea, uOsc, uFrente, uLineaBase; uniform vec3 uOrigen;
+    // Frente irregular (no un círculo perfecto). adelanto > 0: llega antes.
+    float redFrente(vec3 wp, float adelanto){
+      float d = length(wp.xz - uOrigen.xz) + (sin(wp.x * 1.3 + wp.z * 0.4) + cos(wp.z * 1.1 - wp.y * 0.6)) * 0.45;
+      return smoothstep(uFrente + adelanto, uFrente + adelanto - 2.5, d);
+    }
+    // Línea antialiasada sobre una coordenada continua (se cruza un entero → línea)
+    float redLinea(float c){
+      float w = max(fwidth(c) * 1.2, 1e-4);
+      return 1.0 - clamp(abs(fract(c - 0.5) - 0.5) / w, 0.0, 1.0);
+    }
+  `;
+
+  // Malla de alambre que reutiliza la geometría (y las instancias) de un objeto de A.
+  // peso: uniforme compartido por familia (vegetación / resto) para dosificar 03 y 04.
+  function materialAlambre(hex, peso, brillo = 1, base = false) {
+    return new THREE.ShaderMaterial({
+      defines: base ? {USA_BASE: 1} : {},
+      uniforms: {...UR, uPeso: peso, uColor: {value: crudo(hex)}, uBrillo: {value: brillo}, uFogDensity: U.uFogDensity, uTime: U.uTime},
+      wireframe: true,
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      vertexShader: /* glsl */ `
+        varying vec3 vWp;
+        void main(){
+          vec4 lp = vec4(position, 1.0);
+          #ifdef USE_INSTANCING
+            lp = instanceMatrix * lp;
+          #endif
+          vec4 wp = modelMatrix * lp; vWp = wp.xyz;
+          gl_Position = projectionMatrix * viewMatrix * wp;
+        }`,
+      fragmentShader: /* glsl */ `
+        uniform float uPeso, uBrillo, uFogDensity, uTime; uniform vec3 uColor;
+        varying vec3 vWp;
+        ${GLSL_RED}
+        void main(){
+          float k = redFrente(vWp, 0.8) * uLinea;
+          #ifdef USA_BASE
+            k = max(k, uLineaBase);
+          #endif
+          k *= uPeso;
+          if (k < 0.004) discard;
+          vec3 dv = vWp - cameraPosition;
+          float niebla = exp(-uFogDensity * uFogDensity * dot(dv, dv));
+          float vida = 0.78 + 0.22 * sin(uTime * 1.4 + vWp.y * 3.0 + vWp.x * 1.7);
+          gl_FragColor = vec4(uColor * k * niebla * vida * uBrillo, 1.0);
+        }`,
+    });
+  }
+  // Inyecta en un material estándar de three (Lambert/Phong) el apagado detrás del frente
+  // y, opcionalmente, un patrón de hebras propio (musgo). Sin geometría extra.
+  function inyectarRed(mat, {patron = null} = {}) {
+    mat.polygonOffset = true; // las mallas de alambre quedan por delante sin parpadeo
+    mat.polygonOffsetFactor = 1;
+    mat.polygonOffsetUnits = 1;
+    mat.onBeforeCompile = (sh) => {
+      Object.assign(sh.uniforms, UR);
+      if (patron) sh.defines = {...(sh.defines || {}), RED_PATRON: 1};
+      sh.vertexShader = sh.vertexShader
+        .replace('#include <common>', '#include <common>\nvarying vec3 vRedWp;')
+        .replace(
+          '#include <project_vertex>',
+          `#include <project_vertex>
+          vec4 rwp = vec4(transformed, 1.0);
+          #ifdef USE_INSTANCING
+            rwp = instanceMatrix * rwp;
+          #endif
+          vRedWp = (modelMatrix * rwp).xyz;`
+        );
+      sh.fragmentShader = sh.fragmentShader
+        .replace('#include <common>', `#include <common>\nvarying vec3 vRedWp;\n${GLSL_RED}`)
+        .replace(
+          '#include <dithering_fragment>',
+          `#include <dithering_fragment>
+          {
+            gl_FragColor.rgb *= 1.0 - 0.93 * redFrente(vRedWp, -0.8) * uOsc;
+            #ifdef RED_PATRON
+              float hx = redLinea(vRedWp.x * 7.0 + sin(vRedWp.z * 9.0) * 0.35);
+              float hz = redLinea(vRedWp.z * 7.0 + sin(vRedWp.x * 8.0 + vRedWp.y * 5.0) * 0.35);
+              gl_FragColor.rgb += vec3(${patron ? crudo(patron).toArray().map((v) => v.toFixed(3)).join(',') : '0.0,0.0,0.0'}) * max(hx, hz * 0.8) * max(redFrente(vRedWp, 0.8) * uLinea, uLineaBase);
+            #endif
+          }`
+        );
+    };
+    mat.customProgramCacheKey = () => 'red' + (patron || '');
+    return mat;
+  }
+
   function materialMundo({base = 0x1a1714, tipo = 0}) {
     return new THREE.ShaderMaterial({
-      uniforms: {...U, uBase: {value: new THREE.Color(base)}},
+      uniforms: {...U, ...UR, uBase: {value: new THREE.Color(base)}},
       defines: {KIND: tipo},
       vertexShader: /* glsl */ `
-        varying vec3 vWp; varying vec3 vN;
+        varying vec3 vWp; varying vec3 vN; varying vec3 vLoc;
         void main(){
+          vLoc = position;
           vec4 lp = vec4(position, 1.0);
           vec3 nn = normal;
           #ifdef USE_INSTANCING
@@ -1004,9 +1118,10 @@
       fragmentShader: /* glsl */ `
         uniform sampler2D uNoise;
         uniform vec3 uBase, uFogColor, uLight, uAmbient, uLightDir, uNetColor;
-        uniform float uFogDensity, uLava, uLichen, uMoss, uNet, uWet;
-        varying vec3 vWp; varying vec3 vN;
+        uniform float uFogDensity, uLava, uLichen, uMoss, uNet, uWet, uLineaMundo;
+        varying vec3 vWp; varying vec3 vN; varying vec3 vLoc;
         ${GLSL_WAVES}
+        ${GLSL_RED}
         // Proyección simple: suelo por XZ, paredes por XY o ZY según la normal
         vec4 T(vec3 p, vec3 N, float esc){
           #if KIND == 0
@@ -1078,6 +1193,28 @@
             glow += wave * 0.14;
           #endif
           col += uNetColor * glow;
+          // [Fusión] Red lineal (escena 04): la materia se apaga y revela su trama.
+          // Las líneas se calculan siempre (derivadas válidas); el costo es mínimo.
+          #if KIND == 2
+            // corteza → aristas verticales y anillos, como los troncos de B
+            float angT = atan(vLoc.z, vLoc.x) * 7.0 / 6.2832;
+            float wobT = texture2D(uNoise, vec2(vWp.y * 0.07, (vWp.x + vWp.z) * 0.05)).r - 0.5;
+            float linT = max(redLinea(angT + wobT * 0.35), redLinea(vWp.y * 0.85 + wobT * 0.6) * 0.8);
+            vec3 colL = vec3(0.12, 0.75, 0.68);
+          #elif KIND == 1
+            // roca → curvas de nivel lavanda (el alambre de B se suma por encima)
+            float nR = T(p, N, 0.22).r;
+            float linT = redLinea(nR * 11.0) * 0.6;
+            vec3 colL = vec3(0.72, 0.64, 1.0);
+          #else
+            // suelo → tejido irregular de dos familias de curvas (ámbar y turquesa)
+            float nA = texture2D(uNoise, p.xz * 0.05).r, nB = texture2D(uNoise, p.xz * 0.05 + 0.37).g;
+            float linT = max(redLinea(nA * 12.0), redLinea(nB * 12.0) * 0.7);
+            vec3 colL = mix(vec3(1.0, 0.7, 0.28), vec3(0.18, 0.89, 0.82), nB);
+          #endif
+          float kRed = redFrente(vWp, 0.8) * uLineaMundo;
+          col *= 1.0 - 0.93 * redFrente(vWp, -0.8) * uOsc;
+          col += colL * linT * kRed * 1.5;
           // Niebla
           vec3 dv = vWp - cameraPosition;
           float k = uFogDensity * uFogDensity * dot(dv, dv);
@@ -1191,7 +1328,7 @@
     }
     const geo = mergeGeometries(partes);
     geo.computeVertexNormals();
-    return new THREE.Mesh(geo, new THREE.MeshLambertMaterial({vertexColors: true, emissive: 0x1a2a12}));
+    return new THREE.Mesh(geo, inyectarRed(new THREE.MeshLambertMaterial({vertexColors: true, emissive: 0x1a2a12}))); // [Fusión] se apaga con la red
   }
 
   function geoRoca(radio) {
@@ -1245,7 +1382,7 @@
   const NEON = {green: 0x39ff88, pink: 0xff4fd8, yellow: 0xf4ff5a, cyan: 0x4fe3ff, turquoise: 0x2de2c8};
   const TEXT = {
     hint: 'Mantén el gatillo o el pellizco y mueve la mano para girar la célula.',
-    hintLiquen: 'Selecciona el líquen para explorar su mundo interior',
+    hintLiquen: 'Búscame, estoy brillando', // [Fusión] texto exacto de la guía de la escena 01
     timeStart: '400 millones de años',
     timeEnd: 'presente',
   };
@@ -1302,24 +1439,55 @@
 
   // [v3] Emanación: cada partícula nace sobre el talo, asciende despacio, fluctúa y se dispersa.
   // Ciclo de vida propio por partícula (sin explosión); uFront hace subir un frente desde el liquen.
+  // [Fusión] Esporas: misma nube de A (700 partículas, un solo Points) con dos emisiones.
+  // Antes de emitir, cada espora sigue la emanación v3 de A. Al llegar su emisión (uE1 / uE2 =
+  // segundos desde el segundo 2 y el segundo 5 de «Sopla fuerte»), la emanación se congela en
+  // su punto actual y la espora parte en una trayectoria 3D curva propia (material de B:
+  // menta → amarillo, titileo). 45 % sale en la 1.ª emisión (abanico que sube), 55 % en la 2.ª
+  // (más amplia y baja); cada una sale escalonada, nunca todas a la vez.
   const SPORE_VS = `
   uniform float uTime; uniform float uSize; uniform float uSpread; uniform float uAppear; uniform float uFront;
+  uniform float uE1; uniform float uE2;
   attribute float aSeed; attribute float aSpeed; attribute vec3 aDir;
   varying float vA; varying float vMix;
-  void main(){
+  void emanacion(float tt, out vec3 p, out float a){
     float vida = 8.0 + aSpeed * 7.0;
-    float edad = fract((uTime + aSeed * 37.0) / vida);
+    float edad = fract((tt + aSeed * 37.0) / vida);
     float h = edad * (0.55 + aSpeed * 0.7) * (0.65 + 0.35 * uSpread);
-    vec3 p = position;
+    p = position;
     p.xz += aDir.xz * (0.03 + edad * edad * (0.25 + 0.3 * uSpread));
     p.y += 0.03 + h;
-    p.x += sin(uTime * 0.7 + aSeed * 31.0) * 0.025 * (0.3 + edad);
-    p.z += cos(uTime * 0.6 + aSeed * 17.0) * 0.025 * (0.3 + edad);
+    p.x += sin(tt * 0.7 + aSeed * 31.0) * 0.025 * (0.3 + edad);
+    p.z += cos(tt * 0.6 + aSeed * 17.0) * 0.025 * (0.3 + edad);
     float on = smoothstep(aSeed, aSeed + 0.06, uAppear) * step(h, uFront);
-    vA = on * smoothstep(0.0, 0.15, edad) * (1.0 - smoothstep(0.6, 1.0, edad)) * (0.7 + 0.3 * sin(uTime * 1.6 + aSeed * 40.0)) * 0.85;
-    vMix = fract(aSeed * 5.31);
+    a = on * smoothstep(0.0, 0.15, edad) * (1.0 - smoothstep(0.6, 1.0, edad)) * (0.7 + 0.3 * sin(tt * 1.6 + aSeed * 40.0)) * 0.85;
+  }
+  void main(){
+    float s2 = fract(aSeed * 7.13), s3 = fract(aSeed * 3.71), s4 = fract(aSeed * 13.7);
+    float grupo = step(0.45, fract(aSeed * 11.31));
+    float E = mix(uE1, uE2, grupo);
+    float a = E - s2 * mix(1.2, 1.8, grupo);              // salida escalonada dentro de cada emisión
+    float act = step(0.0, E) * smoothstep(0.0, 0.5, a);
+    vec3 pe; float ae;
+    emanacion(uTime - max(a, 0.0) * step(0.0, E), pe, ae); // se congela al emitir: sin saltos
+    float dur = 6.0 + 7.0 * aSpeed + 3.0 * grupo;
+    float k = clamp(a / dur, 0.0, 1.0);
+    float e = 1.0 - pow(1.0 - k, 2.2);
+    vec3 d = normalize(vec3(aDir.x, mix(0.35 + 0.9 * s3, 0.08 + 0.45 * s3, grupo), aDir.z));
+    float giro = e * (s2 * 2.0 - 1.0) * (1.4 + grupo);   // espiral suave alrededor del talo
+    float cg = cos(giro), sg = sin(giro);
+    d.xz = mat2(cg, -sg, sg, cg) * d.xz;
+    float dist = mix(1.0 + 3.0 * s4, 2.4 + 5.5 * s4, grupo) * (0.7 + 0.5 * aSpeed);
+    vec3 q = pe + d * dist * e;
+    q += vec3(sin(uTime * 0.9 + aSeed * 31.0 + e * 4.0), 0.6 * sin(uTime * 0.7 + aSeed * 17.0 + e * 3.0), cos(uTime * 0.8 + aSeed * 23.0 + e * 5.0)) * 0.22 * e;
+    q.y += e * e * (0.4 + 0.8 * s3) * (1.0 - 0.5 * grupo) - k * k * 0.25 * grupo;
+    vec3 p = mix(pe, q, act);
+    float aDisp = smoothstep(0.0, 0.4, a) * (1.0 - smoothstep(0.7, 1.0, k)) * (0.6 + 0.4 * sin(uTime * 3.0 + aSeed * 40.0));
+    vA = mix(ae, aDisp, act);
+    vMix = mix(fract(aSeed * 5.31), s3 * s3, act);
     vec4 mv = modelViewMatrix * vec4(p, 1.0);
-    gl_PointSize = clamp(uSize * (0.6 + aSpeed * 0.7) * 900.0 / max(0.05, -mv.z), 1.0, 12.0);
+    float tam = (0.6 + aSpeed * 0.7) * (1.0 + act * (0.4 + 0.8 * s4) * (1.0 - 0.4 * k));
+    gl_PointSize = clamp(uSize * tam * 900.0 / max(0.05, -mv.z), 1.0, 14.0);
     gl_Position = projectionMatrix * mv; }`;
 
   const NETDOT_VS = `
@@ -1475,6 +1643,14 @@
       this.current = entry;
       this.currentKey = k;
       this.lastStart[k] = now;
+    }
+    // [Fusión] Segundos de reproducción reales de una narración que empezó después de `desde`
+    // (reloj del AudioContext: se detiene si el contexto se suspende). -1 si no ha sonado.
+    segundosDe(k, desde = 0) {
+      if (!this.ready || !this.buffers[k]) return -1;
+      const s = this.lastStart[k];
+      if (s === undefined || s < desde) return -1;
+      return this.ctx.currentTime - s;
     }
     stopNarr(sec = 0.3) {
       if (!this.current) return;
@@ -1673,12 +1849,15 @@
     geo.setAttribute('aSpeed', new THREE.BufferAttribute(speed, 1));
     const mat = additive(SPORE_VS, DOT_FS, {
       uTime: {value: 0},
-      uSize: {value: 0.0075},
+      uSize: {value: 0.009},
       uSpread: {value: 0},
       uAppear: {value: 0},
       uFront: {value: 0},
-      uColor: {value: new THREE.Color(0x52ffa8)}, // neón orgánico: verde liquen
-      uColor2: {value: new THREE.Color(0xd8ff7a)}, // y lima suave
+      uE1: {value: -1}, // [Fusión] segundos desde la 1.ª emisión (-1: aún no)
+      uE2: {value: -1}, // [Fusión] segundos desde la 2.ª emisión
+      // [Fusión] material de las esporas de B: menta → amarillo (valores sRGB directos, como en B)
+      uColor: {value: new THREE.Color().setRGB(0.77, 1.0, 0.9)},
+      uColor2: {value: new THREE.Color().setRGB(1.0, 0.92, 0.31)},
     });
     const pts = new THREE.Points(geo, mat);
     pts.frustumCulled = false;
@@ -1848,20 +2027,27 @@
     alphaCanvas.height = 256;
     const g2 = alphaCanvas.getContext('2d'),
       grad = g2.createLinearGradient(0, 0, 0, 256);
+    // [Fusión] La cúpula baja hasta ~5° sobre el horizonte; la imagen se funde sólo en el último tramo
     grad.addColorStop(0, '#fff');
-    grad.addColorStop(0.2, '#fff');
-    grad.addColorStop(0.32, '#000');
+    grad.addColorStop(0.78, '#fff');
     grad.addColorStop(1, '#000');
     g2.fillStyle = grad;
     g2.fillRect(0, 0, 4, 256);
     const mat = new THREE.MeshBasicMaterial({side: THREE.BackSide, transparent: true, opacity: 0, depthWrite: false, fog: false, alphaMap: new THREE.CanvasTexture(alphaCanvas), color: 0x000000});
-    const mesh = new THREE.Mesh(new THREE.SphereGeometry(45, 48, 12, 0, Math.PI * 2, 0, 1.0), mat);
+    const ALTO = Math.PI * 0.47; // del cénit a ~5° sobre el horizonte (antes 1 rad: sólo un casquete en el cénit)
+    const mesh = new THREE.Mesh(new THREE.SphereGeometry(45, 64, 24, 0, Math.PI * 2, 0, ALTO), mat);
     mesh.renderOrder = -1;
     mesh.visible = false;
     new THREE.TextureLoader().setCrossOrigin('anonymous').load(
       assetUrl('cielo'),
       (tex) => {
         tex.colorSpace = THREE.SRGBColorSpace;
+        // [Fusión] conserva la proporción de la imagen (1774×887, 2:1): la cúpula mide 360° × 85°,
+        // así que se repite en espejo las veces necesarias (2) para no estirarla ni dejar costura
+        const aspecto = tex.image ? tex.image.width / tex.image.height : 2;
+        tex.wrapS = THREE.MirroredRepeatWrapping;
+        tex.repeat.x = Math.max(1, Math.round((Math.PI * 2) / ALTO / aspecto));
+        tex.anisotropy = 4;
         mat.map = tex;
         mat.color.set(0xffffff);
         mat.needsUpdate = true;
@@ -2118,7 +2304,7 @@
 
   function materialLiquen() {
     return new THREE.ShaderMaterial({
-      uniforms: {...U, uGlow: {value: 0.6}, uFoco: {value: 0}, uAlpha: {value: 1}},
+      uniforms: {...U, ...UR, uGlow: {value: 0.6}, uFoco: {value: 0}, uAlpha: {value: 1}},
       vertexColors: true,
       side: THREE.DoubleSide,
       transparent: true,
@@ -2132,6 +2318,7 @@
         uniform float uFogDensity, uNet, uGlow, uFoco, uAlpha;
         varying vec3 vC; varying vec3 vN; varying vec3 vWp; varying vec3 vL; varying float vRn;
         ${GLSL_WAVES}
+        ${GLSL_RED}
         void main(){
           vec3 N = normalize(vN) * (gl_FrontFacing ? 1.0 : -1.0);
           vec3 V = normalize(cameraPosition - vWp);
@@ -2148,6 +2335,10 @@
           float pulso = 0.82 + 0.18 * sin(uTime * 1.1 + vWp.y * 4.0 + vWp.x * 2.0);
           col += vec3(0.5, 0.95, 0.72) * (fr * 0.3 + smoothstep(0.86, 1.0, vRn) * 0.22 + 0.04) * uGlow * pulso;
           col += uNetColor * (waveAt(vWp) * 0.9 + uNet * 0.25);
+          // [Fusión] el talo se vuelve red: anillos de crecimiento + nervios radiales por lóbulo
+          float linL = max(redLinea(vRn * 6.0), redLinea(atan(vL.y, vL.x) * 3.8197) * smoothstep(0.12, 0.3, vRn) * 0.8);
+          col *= 1.0 - 0.85 * redFrente(vWp, -0.8) * uOsc;
+          col += vec3(0.77, 1.0, 0.9) * linL * max(redFrente(vWp, 0.8) * uLinea, uLineaBase) * 1.3;
           vec3 dv = vWp - cameraPosition;
           float k = uFogDensity * uFogDensity * dot(dv, dv) * (1.0 - uFoco);
           col = mix(col, uFogColor, clamp(1.0 - exp(-k), 0.0, 1.0));
@@ -2500,6 +2691,126 @@
   }
 
   /* ==========================================================
+     [Fusión] Escena 2B · Malla de B entre las células de A
+     Técnica de las hifas de B (tubos de alambre de tres lados), pero orgánica:
+     el tubo se tuerce, su radio respira y cada tramo sigue un camino ondulado.
+     Une cada célula con sus vecinas y abraza algunas con espirales parciales.
+     Va dentro del grupo del alga: sigue la rotación con el control y el zoom.
+     ========================================================== */
+  function crearTejidoB(r, celulas) {
+    const pos = [],
+      ord = [],
+      sd = [];
+    const seg = (a, b, ta, tb, s) => {
+      pos.push(a.x, a.y, a.z, b.x, b.y, b.z);
+      ord.push(ta, tb);
+      sd.push(s, s);
+    };
+    const al = () => new V3(r() * 2 - 1, r() * 2 - 1, r() * 2 - 1).normalize();
+    const tubo = (pts, t0, t1, rad, s) => {
+      if (pts.length < 2) return;
+      const curva = new THREE.CatmullRomCurve3(pts, false, 'centripetal');
+      const n = Math.max(5, Math.round(curva.getLength() / 0.0045));
+      const fr = curva.computeFrenetFrames(n, false);
+      const anillo = (i) => {
+        const P = curva.getPointAt(i / n),
+          rr0 = rad * (0.65 + 0.35 * Math.sin(i * 0.9 + s * 6.0));
+        return [0, 1, 2].map((k) => {
+          const g = k * 2.094 + i * 0.38; // torsión: la malla se enrosca, no queda rígida
+          return P.clone().addScaledVector(fr.normals[i], Math.cos(g) * rr0).addScaledVector(fr.binormals[i], Math.sin(g) * rr0);
+        });
+      };
+      let prev = anillo(0);
+      for (let i = 0; i < n; i++) {
+        const sig = anillo(i + 1),
+          ta = lerp(t0, t1, i / n),
+          tb = lerp(t0, t1, (i + 1) / n);
+        for (let k = 0; k < 3; k++) {
+          seg(prev[k], sig[k], ta, tb, s);
+          if (i % 2 === 0) seg(prev[k], prev[(k + 1) % 3], ta, ta, s);
+        }
+        prev = sig;
+      }
+    };
+    const RC = (c) => 0.022 * c.s;
+    const hechos = new Set();
+    celulas.forEach((c, i) => {
+      // uniones ondulantes con las dos vecinas más cercanas
+      celulas
+        .map((o, j) => [j, o.v.distanceTo(c.v)])
+        .filter(([j]) => j !== i)
+        .sort((a, b) => a[1] - b[1])
+        .slice(0, 2)
+        .forEach(([j, dist]) => {
+          const key = i < j ? `${i}-${j}` : `${j}-${i}`;
+          if (hechos.has(key) || dist > 0.1) return;
+          hechos.add(key);
+          const o = celulas[j];
+          const dir = o.v.clone().sub(c.v).normalize();
+          const A = c.v.clone().addScaledVector(dir.clone().addScaledVector(al(), 0.55).normalize(), RC(c) * 1.2);
+          const B = o.v.clone().addScaledVector(dir.clone().negate().addScaledVector(al(), 0.55).normalize(), RC(o) * 1.2);
+          const pts = [A];
+          for (let k = 1; k < 4; k++) pts.push(A.clone().lerp(B, k / 4).addScaledVector(al(), dist * 0.12));
+          pts.push(B);
+          const s = r(),
+            t0 = r() * 0.35;
+          tubo(pts, t0, Math.min(1, t0 + 0.45 + r() * 0.2), 0.0026 + r() * 0.0012, s);
+        });
+      // espiral parcial que abraza la célula (como las hifas de B sobre las algas)
+      if (r() < 0.6) {
+        const eje = al(),
+          [u, w] = (() => {
+            const a = new V3().crossVectors(eje, Math.abs(eje.y) < 0.9 ? new V3(0, 1, 0) : new V3(1, 0, 0)).normalize();
+            return [a, new V3().crossVectors(eje, a)];
+          })();
+        const vueltas = 0.8 + r() * 1.2,
+          ph = r() * TAU,
+          pts = [];
+        for (let j = 0; j <= 12; j++) {
+          const f = j / 12,
+            h = lerp(-0.7, 0.7, f) * RC(c);
+          const rad = Math.sqrt(Math.max(0, RC(c) * RC(c) - h * h)) * 1.28 + 0.0025;
+          const g = ph + f * vueltas * TAU;
+          pts.push(c.v.clone().addScaledVector(eje, h).addScaledVector(u, Math.cos(g) * rad).addScaledVector(w, Math.sin(g) * rad));
+        }
+        const t0 = 0.4 + r() * 0.3;
+        tubo(pts, t0, Math.min(1, t0 + 0.3), 0.0019, r());
+      }
+    });
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    g.setAttribute('aOrd', new THREE.Float32BufferAttribute(ord, 1));
+    g.setAttribute('aSd', new THREE.Float32BufferAttribute(sd, 1));
+    const mat = new THREE.ShaderMaterial({
+      uniforms: {uTime: U.uTime, uFogDensity: U.uFogDensity, uGrow: {value: 0}, uAlpha: {value: 0}},
+      vertexShader: /* glsl */ `
+        attribute float aOrd, aSd; varying float vO, vS; varying vec3 vWp;
+        void main(){ vO = aOrd; vS = aSd; vec4 wp = modelMatrix * vec4(position, 1.0); vWp = wp.xyz;
+          gl_Position = projectionMatrix * viewMatrix * wp; }`,
+      fragmentShader: /* glsl */ `
+        uniform float uTime, uFogDensity, uGrow, uAlpha; varying float vO, vS; varying vec3 vWp;
+        void main(){
+          if (vO > uGrow) discard;
+          vec3 dv = vWp - cameraPosition; float dc = length(dv);
+          float cerca = smoothstep(0.07, 0.25, dc); if (cerca < 0.02) discard;
+          float punta = exp(-(uGrow - vO) * 30.0);                               // punta de crecimiento (B)
+          float savia = pow(0.5 + 0.5 * sin(vO * 70.0 - uTime * 2.2 + vS * 20.0), 8.0); // flujo (B)
+          float respira = 0.6 + 0.4 * sin(uTime * 0.8 + vS * 30.0);
+          vec3 col = mix(vec3(1.0, 0.86, 0.6), vec3(0.78, 1.0, 0.82), fract(vS * 3.7) * 0.6 + vO * 0.4);
+          float a = (0.42 * respira + 0.85 * savia + 1.2 * punta) * uAlpha * cerca * exp(-uFogDensity * uFogDensity * dc * dc);
+          gl_FragColor = vec4(col * a, 1.0);
+        }`,
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+    });
+    const lineas = new THREE.LineSegments(g, mat);
+    lineas.frustumCulled = false;
+    lineas.raycast = () => {};
+    return {lineas, mat};
+  }
+
+  /* ==========================================================
      [v2] Escenas 3 y 4 · Fauna del bosque valdiviano
      Siluetas por SDF (cuerpo continuo, sin primitivas sueltas),
      extremidades tubulares de grosor variable, coloración por zonas.
@@ -2680,8 +2991,9 @@
   }
 
   function buildFaunaV2(heroBeetle) {
-    const mat = new THREE.MeshLambertMaterial({vertexColors: true, emissive: new THREE.Color(0xffffff), emissiveIntensity: 0.03});
-    const matBrillo = new THREE.MeshPhongMaterial({vertexColors: true, specular: new THREE.Color(0.55, 0.5, 0.28), shininess: 55, emissive: new THREE.Color(0xffffff), emissiveIntensity: 0.03});
+    // [Fusión] la fauna también participa: su materia se apaga detrás del frente de la red
+    const mat = inyectarRed(new THREE.MeshLambertMaterial({vertexColors: true, emissive: new THREE.Color(0xffffff), emissiveIntensity: 0.03}));
+    const matBrillo = inyectarRed(new THREE.MeshPhongMaterial({vertexColors: true, specular: new THREE.Color(0.55, 0.5, 0.28), shininess: 55, emissive: new THREE.Color(0xffffff), emissiveIntensity: 0.03}));
     const ch = crearChucao(),
       cv = crearCiervoVolante(),
       rd = crearRanitaDarwin();
@@ -2780,7 +3092,7 @@
         datos.push({x: px, z: pz, y: alturaSuelo(px, pz), s: 0.07 + r() * 0.2, rot: r() * TAU, retraso: r() * 0.5});
       }
     });
-    const mat = new THREE.MeshLambertMaterial({color: 0xffffff});
+    const mat = inyectarRed(new THREE.MeshLambertMaterial({color: 0xffffff}), {patron: NEON_B.lime}); // [Fusión] el musgo se vuelve hebras lima
     const im = new THREE.InstancedMesh(geo, mat, datos.length);
     const cA = new THREE.Color(0x2d5a1c),
       cB = new THREE.Color(0x4f7a26),
@@ -2999,6 +3311,48 @@
 
 
   /* ==========================================================
+     [Fusión] Etiqueta de guía (escena 01): plano con textura de canvas, sin profundidad ni rayos.
+     Tipografía de la landing (Cormorant Garamond itálica) con halo oscuro para leerse sobre cualquier fondo.
+     ========================================================== */
+  function crearEtiquetaGuia(texto) {
+    const W = 1024,
+      H = 160;
+    const cv = document.createElement('canvas');
+    cv.width = W;
+    cv.height = H;
+    const ctx = cv.getContext('2d');
+    const tex = new THREE.CanvasTexture(cv);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.generateMipmaps = false;
+    tex.minFilter = THREE.LinearFilter;
+    const fuente = 'italic 500 70px "Cormorant Garamond", Georgia, serif';
+    const dibujar = () => {
+      ctx.clearRect(0, 0, W, H);
+      ctx.font = fuente;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.shadowColor = 'rgba(0,0,0,0.9)';
+      ctx.shadowBlur = 22;
+      ctx.fillStyle = 'rgba(226,238,222,0.95)';
+      ctx.fillText(texto, W / 2, H / 2);
+      ctx.shadowColor = 'rgba(143,245,207,0.5)';
+      ctx.shadowBlur = 12;
+      ctx.fillText(texto, W / 2, H / 2);
+      tex.needsUpdate = true;
+    };
+    dibujar();
+    document.fonts?.load(fuente).then(dibujar).catch(() => {});
+    const mat = new THREE.MeshBasicMaterial({map: tex, transparent: true, opacity: 0, depthTest: false, depthWrite: false, fog: false, toneMapped: false});
+    const ancho = 0.62; // ~34° de ancho a 1 m: legible sin dominar la vista
+    const mesh = new THREE.Mesh(new THREE.PlaneGeometry(ancho, (ancho * H) / W), mat);
+    mesh.renderOrder = 9000; // por encima de todo salvo el velo de transición
+    mesh.frustumCulled = false;
+    mesh.raycast = () => {};
+    mesh.visible = false;
+    return noPointer(mesh);
+  }
+
+  /* ==========================================================
      Experiencia integrada: mundo y efectos de A + director de B
      ========================================================== */
   class MemoriaLiquen extends xb.Script {
@@ -3069,6 +3423,9 @@
       this.mundo.add(this.suelo);
 
       const matRoca = materialMundo({base: 0x2b2a29, tipo: 1});
+      matRoca.polygonOffset = true; // [Fusión] deja por delante el alambre lavanda de la roca
+      matRoca.polygonOffsetFactor = 1;
+      matRoca.polygonOffsetUnits = 1;
       this.nodosRoca = [];
       this.rocaMadre = new THREE.Mesh(geoRoca(0.55), matRoca);
       this.rocaMadre.position.set(0, 0.12, -1.55);
@@ -3128,7 +3485,7 @@
       const matTronco = materialMundo({base: 0x4a3b2e, tipo: 2});
       this.troncos = new THREE.InstancedMesh(troncoGeo, matTronco, NA);
       this.raices = new THREE.InstancedMesh(new THREE.ConeGeometry(1, 1, 6), matTronco, NA * 4);
-      this.matCopa = new THREE.MeshLambertMaterial({color: 0xffffff, flatShading: true, emissive: 0x000000});
+      this.matCopa = inyectarRed(new THREE.MeshLambertMaterial({color: 0xffffff, flatShading: true, emissive: 0x000000}));
       this.copas = new THREE.InstancedMesh(new THREE.IcosahedronGeometry(1, 1), this.matCopa, NA * 5);
       const cA = new THREE.Color(0x1d3a1c),
         cB = new THREE.Color(0x2b4a22);
@@ -3138,6 +3495,9 @@
         im.visible = false;
         this.mundo.add(im);
       });
+      // [Fusión] malla de las copas: misma geometría y mismas instancias (no se duplica el bosque)
+      this.alambres = [];
+      this.alambre(this.copas, NEON_B.teal, PESO.veg, 0.9, true);
 
       const usneaPos = [];
       const usneaDe = (t, rand, range) => {
@@ -3165,10 +3525,15 @@
       const ug = new THREE.BufferGeometry();
       ug.setAttribute('position', new THREE.Float32BufferAttribute(usneaPos, 3));
       this.matUsnea = new THREE.ShaderMaterial({
-        uniforms: {...U, uAlpha: {value: 0}},
+        uniforms: {...U, ...UR, uAlpha: {value: 0}},
         vertexShader: `uniform float uNet; uniform vec3 uNetColor; varying vec3 vC; ${GLSL_WAVES}
+          uniform float uLinea, uFrente, uLineaBase; uniform vec3 uOrigen;
           void main(){ vec4 wp=modelMatrix*vec4(position,1.0); float w = waveAt(wp.xyz)*1.4 + uNet*0.25;
-            vC = vec3(0.68,0.74,0.6)*0.55 + uNetColor*w; gl_Position=projectionMatrix*viewMatrix*wp; }`,
+            vC = vec3(0.68,0.74,0.6)*0.55 + uNetColor*w;
+            // [Fusión] la usnea ya es filamento: se enciende en menta (barbas de B)
+            float dR = length(wp.xz - uOrigen.xz);
+            vC = mix(vC, vec3(0.77, 1.0, 0.9) * 1.4, max(smoothstep(uFrente + 0.8, uFrente - 1.7, dR) * uLinea, uLineaBase));
+            gl_Position=projectionMatrix*viewMatrix*wp; }`,
         fragmentShader: `precision mediump float; uniform float uAlpha; varying vec3 vC; void main(){ gl_FragColor = vec4(vC, uAlpha); }`,
         transparent: true,
         depthWrite: false,
@@ -3197,8 +3562,9 @@
         const s = rr(0.6, 1.5);
         for (let k = 0; k < 6; k++) this.datosHelecho.push({x, z, y: alturaSuelo(x, z) - 0.02, rot: (k / 6) * TAU + rr(-0.2, 0.2), incl: rr(0.5, 0.95), s, retraso: rnd() * 0.6});
       }
-      this.helechos = new THREE.InstancedMesh(fronda, new THREE.MeshLambertMaterial({color: 0x3f6b2a, side: THREE.DoubleSide}), this.datosHelecho.length);
+      this.helechos = new THREE.InstancedMesh(fronda, inyectarRed(new THREE.MeshLambertMaterial({color: 0x3f6b2a, side: THREE.DoubleSide})), this.datosHelecho.length);
       this.helechos.frustumCulled = false;
+      this.alambre(this.helechos, NEON_B.lime, PESO.veg, 1.1, true); // [Fusión] frondas → nervaduras lima
       this.helechos.visible = false;
       this.mundo.add(this.helechos);
 
@@ -3276,7 +3642,8 @@
       this.celulas.material = materialCelula();
       this.brilloAlga = sprite('rgba(120,255,140,0.9)', 0.8);
       this.interfaz = crearInterfaz(rng(91), this.celulas.userData.celulas, this.micelio.uniformes); // [v2] 02B
-      this.alga.add(this.celulas, this.brilloAlga, this.interfaz.grupo);
+      this.tejidoB = crearTejidoB(rng(123), this.celulas.userData.celulas); // [Fusión] malla de B en 02B
+      this.alga.add(this.celulas, this.brilloAlga, this.interfaz.grupo, this.tejidoB.lineas);
       const NH = 70;
       this.hilo = new THREE.Points(
         new THREE.BufferGeometry().setAttribute('position', new THREE.BufferAttribute(new Float32Array(NH * 3), 3)),
@@ -3396,6 +3763,13 @@
 
       // A anulaba el raycast en toda la escena; aquí sólo en el decorado,
       // para que los proxies (B) y los botones de navegación sigan respondiendo.
+      // [Fusión] mallas de alambre de B sobre la geometría existente de A: rocas, talo y fauna
+      this.alambre(this.rocaMadre, NEON_B.lavender, PESO.resto, 0.85);
+      this.alambre(this.rocas, NEON_B.lavender, PESO.resto, 0.6);
+      this.alambre(this.talo, NEON_B.mint, PESO.resto, 0.45);
+      const mallasFauna = [];
+      this.fauna.list.forEach((g) => g.traverse((o) => o.isMesh && mallasFauna.push(o)));
+      mallasFauna.forEach((o) => this.alambre(o, NEON_B.orange, PESO.resto, 0.5));
       decorado(this.mundo);
       decorado(this.escenario, {contenedores: false}); // [v2] corrige el bug del control (ver decorado)
       decorado(this.cielo);
@@ -3575,6 +3949,9 @@
       this.hintLiquen.add(new xb.FaceCamera({mode: 'spherical', smoothing: 0.2}));
       this.hintLiquen.visible = false;
       this.escenario.add(this.hintLiquen);
+      // [Fusión] la guía de la escena 01 es ahora una etiqueta ligera anclada a la vista (ver actualizarGuia)
+      this.guiaTexto = crearEtiquetaGuia(TEXT.hintLiquen);
+      this.add(this.guiaTexto);
 
       // [v3] misma línea; un punto marca el avance al final de la parte recorrida
       this.timeFill = new xb.UIPanel({style: {width: '0%', height: 6, borderRadius: 3, backgroundColor: '#2de2c8', flexShrink: 0}});
@@ -3650,6 +4027,7 @@
             this.a01Hecho = false;
             this.bosqueRestaurado = false;
             this.hintLiquen.visible = false;
+            this.tGuia = null; // [Fusión] momento en que aparece «Búscame, estoy brillando»
             this.resetTalos(1);
             U.uWaves.value.forEach((w) => w.set(0, 0, -999, 0)); // [v3] sin restos de las ondas de la escena 04
           },
@@ -3670,16 +4048,23 @@
             L.proxies.forEach((p) => {
               p.visible = elegible;
             });
-            this.hintLiquen.visible = elegible && t >= introFin + 3;
+            // [Fusión] búsqueda del liquen: el bosque entra en penumbra (sin apagarse) y aparece la guía
+            // anclada a la vista. Si en 20 s nadie elige, se elige el liquen que el visitante tiene enfrente.
+            const buscando = elegible && this.veilState.pending === null;
+            if (buscando && this.tGuia === null) this.tGuia = t;
+            if (buscando && t >= this.tGuia + 20) this.seleccionarLiquen(this.taloEnLaMirada());
+            this.actualizarGuia(dt, buscando && this.tSel === null);
+            const penumbra = 0.62 * sm(t, introFin - 2, introFin + 4);
+            this.penumbra(penumbra);
             const pulso = 0.5 + 0.5 * Math.sin(t * 1.25);
             L.clusters.forEach((c, i) => {
               const sel = this.zoomLiq && i === this.zoomLiq.idx;
               const guia = i === this.guia ? 1.5 + 0.6 * pulso : 1;
-              c.material.uniforms.uIntensity.value = reveal * 0.4 * guia * (i === this.hovered ? 2.2 : 1) * (sel ? 1 - e : 1 - out);
+              c.material.uniforms.uIntensity.value = reveal * 0.4 * guia * (1 + 1.3 * penumbra) * (i === this.hovered ? 2.2 : 1) * (sel ? 1 - e : 1 - out);
             });
             this.talos.forEach((tl, i) => {
               if (this.zoomLiq && i === this.zoomLiq.idx) return;
-              tl.mat.uniforms.uGlow.value = 0.5 + reveal * 0.35 + (i === this.guia ? 0.25 + 0.3 * pulso : 0) + (i === this.hovered ? 0.9 : 0);
+              tl.mat.uniforms.uGlow.value = 0.5 + reveal * 0.35 + penumbra * 0.75 + (i === this.guia ? 0.25 + 0.3 * pulso : 0) + (i === this.hovered ? 0.9 : 0);
             });
             this.matTaloSec.uniforms.uGlow.value = 0.45 + reveal * 0.2;
             this.matTaloSec.uniforms.uAlpha.value = 1 - out;
@@ -3698,6 +4083,7 @@
           },
           exit: () => {
             this.hintLiquen.visible = false;
+            this.ocultarGuia();
             this.lichens.proxies.forEach((p) => (p.visible = false));
           },
         },
@@ -3778,6 +4164,9 @@
             this.interfaz.dotMat.uniforms.uFade.value = sm(t, 5, 9);
             this.interfaz.dotMat.uniforms.uSize.value = 0.0016 * esc;
             this.micelio.uniformes.uSepto.value = sm(t, 9, 14);
+            // [Fusión] la malla de B crece entre las células, por debajo de las hebras de A
+            this.tejidoB.mat.uniforms.uGrow.value = sm(t, 3, 13);
+            this.tejidoB.mat.uniforms.uAlpha.value = 0.9 * sm(t, 3.5, 8);
             this.celulas.material.uniforms.uDetalle.value = 0.3 + 0.7 * sm(lS, Math.log(2.2), Math.log(9));
             this.hint.visible = t > 3 && t < 15 && !this.rot.used;
             if (!this.rot.active) this.symPivot.rotation.y += dt * 0.05;
@@ -3812,6 +4201,9 @@
             resetLichens(0);
             this.timeline.visible = true;
             this.etapaActual = -1;
+            // [Fusión] esporas: las dos emisiones se anclan a la reproducción real de «Sopla fuerte»
+            this.esp = {e1: null, e2: null};
+            P.mat.uniforms.uE1.value = P.mat.uniforms.uE2.value = -1;
           },
           update: (t, dt) => {
             const g = geoEn(t);
@@ -3830,6 +4222,7 @@
             this.interfaz.unif.uAlpha.value = this.symFrom.rev * queda;
             this.interfaz.apre.material.opacity = this.symFrom.rev * queda * 0.95;
             this.interfaz.dotMat.uniforms.uFade.value = this.symFrom.rev * queda;
+            this.tejidoB.mat.uniforms.uAlpha.value = 0.9 * this.symFrom.rev * queda;
             this.symPivot.visible = t < 3.2;
             const fl = Math.sin(clamp((t - 1.6) / 2.4) * Math.PI);
             this.destello.position.copy(sobre);
@@ -3847,6 +4240,17 @@
             P.mat.uniforms.uAppear.value = 0.5 * sm(t, 6.5, 13) * (1 - sm(t, 43, 49));
             P.mat.uniforms.uSpread.value = sm(t, 10.3, 18);
             P.mat.uniforms.uFront.value = Math.max(0, t - 6.5) * 0.2;
+            // [Fusión] 1.ª emisión en el segundo 2 de «Sopla fuerte» y 2.ª en el segundo 5.
+            // ref = segundos reales de reproducción (reloj del audio; se detiene en pausa).
+            // Respaldo, sólo si la pista no llegó a sonar: el tiempo desde su entrada (10,3 s).
+            const pa = A.segundosDe('a05', this.ctxEntrada);
+            const ref = pa >= 0 ? pa : t >= 11.8 ? t - 10.3 : -1;
+            if (this.esp.e1 === null && ref >= 2) this.esp.e1 = t - (ref - 2);
+            if (this.esp.e2 === null && ref >= 5) this.esp.e2 = t - (ref - 5);
+            P.mat.uniforms.uE1.value = this.esp.e1 === null ? -1 : t - this.esp.e1;
+            P.mat.uniforms.uE2.value = this.esp.e2 === null ? -1 : t - this.esp.e2;
+            // [Fusión] neón sutil: aparece cuando empieza a crecer la vegetación (musgo, helechos, copas)
+            this.aplicarRed({base: 0.24 * sm(t, 15, 24), veg: 1});
             L.clusters.forEach((c) => {
               c.material.uniforms.uIntensity.value = 0.7 * sm(t, 38, 42);
             });
@@ -3885,7 +4289,7 @@
             this.resetTalos(1);
           },
           update: (t, dt) => {
-            const back = sm(t, 30, 37.5);
+            const back = sm(t, 31.5, 37.5); // [Fusión] la red completa se contempla ~4 s antes de volver
             const vivo = 1 - back;
             this.aplicarGeologia(1, 0);
             // Anochecer (A)
@@ -3901,7 +4305,11 @@
             this.sol.intensity = lerp(0.8, 0.05, noche);
             this.lluvia.visible = this.calidad > 0 && back > 0.95;
             // Red de A: el despertar avanza con el tiempo (antes: con la respiración)
-            const despertar = ramp(t, 0, 12);
+            const despertar = ramp(t, 1, 24); // [Fusión] las conexiones crecen junto con la transformación
+            // [Fusión] transformación A → B (25 s): un frente nace en el liquen de la roca y recorre
+            // fauna, talos, vegetación, troncos, rocas y suelo; detrás, la materia se apaga y queda su trama.
+            const prog = sm(t, 2, 27);
+            this.aplicarRed({linea: vivo, base: 0.24 * vivo, osc: vivo, frente: -1 + prog * 26, mundo: vivo, veg: 1, resto: 1});
             this.matRed.uniforms.uAlpha.value = noche;
             this.matRed.uniforms.uAwake.value = 1.5 + despertar * (this.maxDistRed + 3);
             U.uNet.value = despertar * 0.9 * vivo;
@@ -3932,12 +4340,13 @@
             this.matTaloSec.uniforms.uGlow.value = 0.5 + 0.4 * noche;
             this.talo.scale.setScalar(Math.max(0.0001, 1.6 * vivo));
             L.clusters.forEach((c) => {
-              c.material.uniforms.uIntensity.value = 0.7 * vivo;
+              c.material.uniforms.uIntensity.value = (0.7 + 0.8 * prog) * vivo;
             });
             this.animateFauna(t);
             this.sonidoA(4, t, dt, {vivo, noche});
           },
           exit: () => {
+            this.aplicarRed();
             U.uNet.value = 0;
             this.matCopa.emissive.setRGB(0, 0, 0);
             this.red.visible = false;
@@ -3960,6 +4369,87 @@
       this.symProxy.visible = this.idx === 2;
       this.destello.material.opacity = 0;
       this.talos.forEach((tl) => (tl.main.visible = tl.sec.visible = !!on.lichens));
+      this.aplicarRed(); // [Fusión] cada escena parte sin red; 03 y 04 la encienden en su update
+    }
+
+    /* ---------------- [Fusión] Red lineal y guía de la escena 01 ---------------- */
+    // Agrega una malla de alambre que comparte geometría (y, si es instanciado, las instancias) con obj.
+    alambre(obj, hex, peso, brillo = 1, base = false) {
+      const mat = materialAlambre(hex, peso, brillo, base);
+      let w;
+      if (obj.isInstancedMesh) {
+        w = new THREE.InstancedMesh(obj.geometry, mat, obj.count);
+        w.instanceMatrix = obj.instanceMatrix;
+      } else w = new THREE.Mesh(obj.geometry, mat);
+      w.frustumCulled = false;
+      w.raycast = () => {};
+      noPointer(w);
+      w.renderOrder = 2;
+      w.visible = false;
+      obj.add(w);
+      this.alambres.push({w, obj, peso, base});
+      return w;
+    }
+    aplicarRed({linea = 0, base = 0, osc = 0, frente = 999, mundo = 0, veg = 0, resto = 0} = {}) {
+      UR.uLinea.value = linea;
+      UR.uLineaBase.value = base;
+      UR.uOsc.value = osc;
+      UR.uFrente.value = frente;
+      UR.uLineaMundo.value = mundo;
+      PESO.veg.value = veg;
+      PESO.resto.value = resto;
+      for (const a of this.alambres) {
+        a.w.visible = a.peso.value > 0.001 && (linea > 0.001 || (a.base && base > 0.001));
+        if (a.obj.isInstancedMesh) a.w.count = a.obj.count;
+      }
+    }
+    // Penumbra de la escena 01: baja luz, cielo y niebla de A sin tocar la densidad de niebla,
+    // así los líquenes cercanos (que brillan por sí mismos) quedan como lo más visible.
+    penumbra(k) {
+      if (k <= 0.001) return;
+      const f = 1 - k;
+      const cu = this.cielo.material.uniforms;
+      cu.uTop.value.multiplyScalar(f);
+      cu.uBot.value.multiplyScalar(f);
+      U.uFogColor.value.multiplyScalar(f);
+      this.niebla.color.copy(U.uFogColor.value);
+      U.uLight.value.multiplyScalar(f);
+      U.uAmbient.value.multiplyScalar(lerp(1, 0.55, k));
+      this.hemi.intensity *= f;
+      this.sol.intensity *= f;
+      this.matUsnea.uniforms.uAlpha.value *= lerp(1, 0.6, k);
+      this.matPart.uniforms.uAlpha.value *= f;
+      this.neblina.mat.opacity *= f;
+    }
+    // «Búscame, estoy brillando»: anclada a la parte baja de la vista, sigue la cabeza con suavidad,
+    // sin profundidad (nunca queda detrás de la vegetación) y sin rayos (no interfiere con el gatillo).
+    actualizarGuia(dt, mostrar) {
+      const g = this.guiaTexto;
+      const op = g.material.opacity + ((mostrar ? 0.92 : 0) - g.material.opacity) * (1 - Math.exp(-(mostrar ? 2.5 : 5) * dt));
+      g.material.opacity = op;
+      g.visible = op > 0.01;
+      if (!g.visible) {
+        g.userData.listo = false;
+        return;
+      }
+      xb.core.camera.getWorldQuaternion(_q);
+      _e.setFromQuaternion(_q, 'YXZ');
+      const ud = g.userData;
+      if (!ud.listo) {
+        ud.yaw = _e.y;
+        ud.pitch = _e.x;
+        ud.listo = true;
+      }
+      const k = 1 - Math.exp(-7 * dt);
+      ud.yaw += Math.atan2(Math.sin(_e.y - ud.yaw), Math.cos(_e.y - ud.yaw)) * k;
+      ud.pitch += (THREE.MathUtils.clamp(_e.x, -1.2, 1.2) - ud.pitch) * k;
+      g.quaternion.setFromEuler(_e.set(ud.pitch, ud.yaw, 0, 'YXZ'));
+      g.position.set(0, -0.3, -1.0).applyQuaternion(g.quaternion).add(this.cabeza);
+    }
+    ocultarGuia() {
+      this.guiaTexto.material.opacity = 0;
+      this.guiaTexto.visible = false;
+      this.guiaTexto.userData.listo = false;
     }
 
     /* ---------------- [v2] Escena 1: talos y acercamiento al liquen ---------------- */
@@ -4069,6 +4559,8 @@
       // [v2] interfaz oculta y estructura centrada de nuevo
       this.organismos.position.set(0, 0, 0);
       this.revInterfaz = 0;
+      this.tejidoB.mat.uniforms.uAlpha.value = 0; // [Fusión]
+      this.tejidoB.mat.uniforms.uGrow.value = 0;
       this.interfaz.unif.uAlpha.value = 0;
       this.interfaz.apre.material.opacity = 0;
       this.interfaz.dotMat.uniforms.uFade.value = 0;
@@ -4417,6 +4909,7 @@
       this.symFocal.set(0, this.altOjos - 0.05, -0.72); // [v2] la célula focal termina a ~0,7 m de los ojos
       this.hint.position.set(0, this.altOjos - 0.75, -1.0);
       this.hintLiquen.position.set(0, this.altOjos - 0.38, -1.25);
+      this.escenario.localToWorld(UR.uOrigen.value.copy(this.thallusRest)); // [Fusión] la red nace en el liquen de la roca
       this.nav.visible = true;
       this.audio.unlock();
       this.enterScene(0);
@@ -4443,6 +4936,7 @@
       this.prevIdx = this.idx;
       this.idx = i;
       this.t = 0;
+      this.ctxEntrada = this.audio.ctx ? this.audio.ctx.currentTime : 0; // [Fusión] referencia para sincronizar con narraciones
       this.fired = new Set();
       this.hint.visible = false;
       this.timeline.visible = false;
@@ -4531,6 +5025,7 @@
     }
 
     tickShared(sec) {
+      this.tejidoB.lineas.visible = this.tejidoB.mat.uniforms.uAlpha.value > 0.001; // [Fusión] sin costo fuera de 02B
       for (const c of this.lichens.clusters) c.material.uniforms.uTime.value = sec;
       this.spores.mat.uniforms.uTime.value = sec;
       this.netB.dotMat.uniforms.uTime.value = sec;
@@ -4573,6 +5068,11 @@
       this.spores.pts.geometry.setDrawRange(0, this.spores.N / 2);
       this.netB.dots.geometry.setDrawRange(0, this.netB.N / 2);
       this.neblina.grupo.visible = false;
+      // [Fusión] las mallas de alambre más densas (fauna y talo de la roca) quedan fuera en calidad baja
+      this.alambres.forEach((a) => {
+        if (a.obj.parent && (a.obj === this.talo || this.fauna.list.some((f) => f === a.obj || f.children.includes(a.obj)))) a.obj.remove(a.w);
+      });
+      this.tejidoB.lineas.geometry.setDrawRange(0, Math.floor(this.tejidoB.lineas.geometry.attributes.position.count * 0.6) & ~1);
       console.info('Memoria Líquen: calidad reducida para mantener la fluidez.');
     }
 
